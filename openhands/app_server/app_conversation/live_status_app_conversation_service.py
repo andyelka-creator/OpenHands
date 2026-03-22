@@ -1,4 +1,5 @@
 import asyncio
+import http.client
 import json
 import logging
 import os
@@ -7,8 +8,9 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, AsyncGenerator, Sequence, cast
+from typing import Any, AsyncGenerator, Sequence
 from uuid import UUID, uuid4
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Request
@@ -41,13 +43,9 @@ from openhands.app_server.app_conversation.app_conversation_service import (
 )
 from openhands.app_server.app_conversation.app_conversation_service_base import (
     AppConversationServiceBase,
-    get_project_dir,
 )
 from openhands.app_server.app_conversation.app_conversation_start_task_service import (
     AppConversationStartTaskService,
-)
-from openhands.app_server.app_conversation.hook_loader import (
-    load_hooks_from_agent_server,
 )
 from openhands.app_server.app_conversation.sql_app_conversation_info_service import (
     SQLAppConversationInfoService,
@@ -61,9 +59,6 @@ from openhands.app_server.event_callback.event_callback_service import (
 )
 from openhands.app_server.event_callback.set_title_callback_processor import (
     SetTitleCallbackProcessor,
-)
-from openhands.app_server.pending_messages.pending_message_service import (
-    PendingMessageService,
 )
 from openhands.app_server.sandbox.docker_sandbox_service import DockerSandboxService
 from openhands.app_server.sandbox.sandbox_models import (
@@ -84,10 +79,9 @@ from openhands.app_server.utils.llm_metadata import (
     get_llm_metadata,
     should_set_litellm_extra_body,
 )
-from openhands.integrations.provider import PROVIDER_TOKEN_TYPE, ProviderType
+from openhands.integrations.provider import ProviderType
 from openhands.integrations.service_types import SuggestedTask
 from openhands.sdk import Agent, AgentContext, LocalWorkspace
-from openhands.sdk.hooks import HookConfig
 from openhands.sdk.llm import LLM
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, SecretValue, StaticSecret
@@ -95,7 +89,6 @@ from openhands.sdk.utils.paging import page_iterator
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 from openhands.server.types import AppMode
 from openhands.storage.data_models.conversation_metadata import ConversationTrigger
-from openhands.storage.data_models.settings import SandboxGroupingStrategy
 from openhands.tools.preset.default import (
     get_default_tools,
 )
@@ -134,21 +127,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
     sandbox_service: SandboxService
     sandbox_spec_service: SandboxSpecService
     jwt_service: JwtService
-    pending_message_service: PendingMessageService
     sandbox_startup_timeout: int
     sandbox_startup_poll_frequency: int
-    max_num_conversations_per_sandbox: int
     httpx_client: httpx.AsyncClient
     web_url: str | None
     openhands_provider_base_url: str | None
     access_token_hard_timeout: timedelta | None
     app_mode: str | None = None
     tavily_api_key: str | None = None
-
-    async def _get_sandbox_grouping_strategy(self) -> SandboxGroupingStrategy:
-        """Get the sandbox grouping strategy from user settings."""
-        user_info = await self.user_context.get_user_info()
-        return user_info.sandbox_grouping_strategy
 
     async def search_app_conversations(
         self,
@@ -157,7 +143,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         created_at__lt: datetime | None = None,
         updated_at__gte: datetime | None = None,
         updated_at__lt: datetime | None = None,
-        sandbox_id__eq: str | None = None,
         sort_order: AppConversationSortOrder = AppConversationSortOrder.CREATED_AT_DESC,
         page_id: str | None = None,
         limit: int = 20,
@@ -170,7 +155,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             created_at__lt=created_at__lt,
             updated_at__gte=updated_at__gte,
             updated_at__lt=updated_at__lt,
-            sandbox_id__eq=sandbox_id__eq,
             sort_order=sort_order,
             page_id=page_id,
             limit=limit,
@@ -188,7 +172,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         created_at__lt: datetime | None = None,
         updated_at__gte: datetime | None = None,
         updated_at__lt: datetime | None = None,
-        sandbox_id__eq: str | None = None,
     ) -> int:
         return await self.app_conversation_info_service.count_app_conversation_info(
             title__contains=title__contains,
@@ -196,7 +179,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             created_at__lt=created_at__lt,
             updated_at__gte=updated_at__gte,
             updated_at__lt=updated_at__lt,
-            sandbox_id__eq=sandbox_id__eq,
         )
 
     async def get_app_conversation(
@@ -270,20 +252,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
             assert sandbox_spec is not None
 
-            # Set up conversation id
-            conversation_id = request.conversation_id or uuid4()
-
-            # Setup working dir based on grouping
-            working_dir = sandbox_spec.working_dir
-            sandbox_grouping_strategy = await self._get_sandbox_grouping_strategy()
-            if sandbox_grouping_strategy != SandboxGroupingStrategy.NO_GROUPING:
-                working_dir = f'{working_dir}/{conversation_id.hex}'
-
             # Run setup scripts
             remote_workspace = AsyncRemoteWorkspace(
                 host=agent_server_url,
                 api_key=sandbox.session_api_key,
-                working_dir=working_dir,
+                working_dir=sandbox_spec.working_dir,
             )
             async for updated_task in self.run_setup_scripts(
                 task, sandbox, remote_workspace, agent_server_url
@@ -294,13 +267,13 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             start_conversation_request = (
                 await self._build_start_conversation_request_for_user(
                     sandbox,
-                    conversation_id,
                     request.initial_message,
                     request.system_message_suffix,
                     request.git_provider,
-                    working_dir,
+                    sandbox_spec.working_dir,
                     request.agent_type,
                     request.llm_model,
+                    request.conversation_id,
                     remote_workspace=remote_workspace,
                     selected_repository=request.selected_repository,
                     plugins=request.plugins,
@@ -315,12 +288,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # Start conversation...
             body_json = start_conversation_request.model_dump(
                 mode='json', context={'expose_secrets': True}
-            )
-            # Log hook_config to verify it's being passed
-            hook_config_in_request = body_json.get('hook_config')
-            _logger.debug(
-                f'Sending StartConversationRequest with hook_config: '
-                f'{hook_config_in_request}'
             )
             response = await self.httpx_client.post(
                 f'{agent_server_url}/api/conversations',
@@ -355,13 +322,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # Setup default processors
             processors = request.processors or []
 
-            # Always ensure SetTitleCallbackProcessor is included
-            has_set_title_processor = any(
-                isinstance(processor, SetTitleCallbackProcessor)
-                for processor in processors
-            )
-            if not has_set_title_processor:
-                processors.append(SetTitleCallbackProcessor())
+            if os.environ.get('OH_DISABLE_SET_TITLE_PROCESSOR', '0').lower() not in ('1', 'true', 'yes'):
+                # Always ensure SetTitleCallbackProcessor is included
+                has_set_title_processor = any(
+                    isinstance(processor, SetTitleCallbackProcessor)
+                    for processor in processors
+                )
+                if not has_set_title_processor:
+                    processors.append(SetTitleCallbackProcessor())
 
             # Save processors
             for processor in processors:
@@ -382,25 +350,138 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 self.httpx_client,
             )
 
-            # Update the start task
+            # Update the start task first so the app-side startup path does not
+            # block on a long-running /events request. In our self-hosted setup
+            # the events endpoint can stay open for the duration of the first
+            # agent turn, so deliver the initial message in the background after
+            # the conversation is marked READY.
             task.status = AppConversationStartTaskStatus.READY
             task.app_conversation_id = info.id
-            yield task
 
-            # Process any pending messages queued while waiting for conversation
-            if sandbox.session_api_key:
-                await self._process_pending_messages(
-                    task_id=task.id,
-                    conversation_id=info.id,
-                    agent_server_url=agent_server_url,
-                    session_api_key=sandbox.session_api_key,
+            if (
+                request.initial_message
+                and sandbox.session_api_key
+            ):
+                asyncio.create_task(
+                    self._post_create_message_via_events(
+                        conversation_id=info.id,
+                        agent_server_url=agent_server_url,
+                        session_api_key=sandbox.session_api_key,
+                        initial_message=request.initial_message,
+                    )
                 )
+
+            yield task
 
         except Exception as exc:
             _logger.exception('Error starting conversation', stack_info=True)
             task.status = AppConversationStartTaskStatus.ERROR
             task.detail = str(exc)
             yield task
+
+    async def _post_create_message_via_events(
+        self,
+        conversation_id: UUID,
+        agent_server_url: str,
+        session_api_key: str,
+        initial_message: SendMessageRequest,
+    ) -> None:
+        if os.environ.get('OH_DISABLE_POST_CREATE_HELPER', '0').lower() in ('1', 'true', 'yes'):
+            _logger.warning(
+                'OH_DISABLE_POST_CREATE_HELPER is enabled; skipping background post-create helper for conversation %s',
+                conversation_id,
+            )
+            return
+
+        event_url = f'{agent_server_url}/api/conversations/{str(conversation_id)}/events'
+        content_json = [item.model_dump() for item in initial_message.content]
+        _logger.warning(
+            'Background post-create run via events for conversation %s through %s',
+            conversation_id,
+            event_url,
+        )
+        _logger.warning(
+            'Background post-create auth present=%s key_len=%s for conversation %s',
+            bool(session_api_key),
+            len(session_api_key) if session_api_key else 0,
+            conversation_id,
+        )
+
+        def _post_via_http_client() -> tuple[tuple[int, str], tuple[int, str]]:
+            parsed = urlparse(event_url)
+            assert parsed.hostname is not None
+            event_path = parsed.path or '/'
+            if parsed.query:
+                event_path += f'?{parsed.query}'
+            headers = {
+                'Host': parsed.netloc,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Connection': 'close',
+                'X-Session-API-Key': session_api_key,
+            }
+            body = json.dumps(
+                {
+                    'role': initial_message.role,
+                    'content': content_json,
+                    'run': False,
+                }
+            )
+
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=120)
+            try:
+                conn.request('POST', event_path, body=body, headers=headers)
+                response = conn.getresponse()
+                event_payload = response.read().decode('utf-8', errors='replace')
+                event_result = (response.status, event_payload)
+            finally:
+                conn.close()
+
+            run_path = f'/api/conversations/{str(conversation_id)}/run'
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=120)
+            try:
+                conn.request('POST', run_path, body='{}', headers=headers)
+                response = conn.getresponse()
+                run_payload = response.read().decode('utf-8', errors='replace')
+                run_result = (response.status, run_payload)
+            finally:
+                conn.close()
+
+            return event_result, run_result
+
+        try:
+            (event_status, event_text), (run_status, run_text) = await asyncio.to_thread(_post_via_http_client)
+            _logger.warning(
+                'Background post-create events response for conversation %s: status=%s body=%s',
+                conversation_id,
+                event_status,
+                event_text[:500],
+            )
+            _logger.warning(
+                'Background post-create run response for conversation %s: status=%s body=%s',
+                conversation_id,
+                run_status,
+                run_text[:500],
+            )
+            if event_status >= 400:
+                raise RuntimeError(
+                    f'Background post-create events returned HTTP {event_status}: {event_text[:500]}'
+                )
+            if run_status >= 400 and run_status != 409:
+                raise RuntimeError(
+                    f"Background post-create run returned HTTP {run_status}: {run_text[:500]}"
+                )
+            if run_status == 409:
+                _logger.info(
+                    "Background post-create run already active for conversation %s (HTTP 409)",
+                    conversation_id,
+                )
+        except Exception as e:
+            _logger.warning(
+                f'Failed background post-create message for conversation {conversation_id}: {e}',
+                exc_info=True,
+            )
+
 
     async def _build_app_conversations(
         self, app_conversation_infos: Sequence[AppConversationInfo | None]
@@ -534,157 +615,21 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 result[stored_conversation.sandbox_id].append(stored_conversation.id)
         return result
 
-    async def _find_running_sandbox_for_user(self) -> SandboxInfo | None:
-        """Find a running sandbox for the current user based on the grouping strategy.
-
-        Returns:
-            SandboxInfo if a running sandbox is found, None otherwise.
-        """
-        try:
-            user_id = await self.user_context.get_user_id()
-            sandbox_grouping_strategy = await self._get_sandbox_grouping_strategy()
-
-            # If no grouping, return None to force creation of a new sandbox
-            if sandbox_grouping_strategy == SandboxGroupingStrategy.NO_GROUPING:
-                return None
-
-            # Collect all running sandboxes for this user
-            running_sandboxes = []
-            page_id = None
-            while True:
-                page = await self.sandbox_service.search_sandboxes(
-                    page_id=page_id, limit=100
-                )
-
-                for sandbox in page.items:
-                    if (
-                        sandbox.status == SandboxStatus.RUNNING
-                        and sandbox.created_by_user_id == user_id
-                    ):
-                        running_sandboxes.append(sandbox)
-
-                if page.next_page_id is None:
-                    break
-                page_id = page.next_page_id
-
-            if not running_sandboxes:
-                return None
-
-            # Apply the grouping strategy
-            return await self._select_sandbox_by_strategy(
-                running_sandboxes, sandbox_grouping_strategy
-            )
-
-        except Exception as e:
-            _logger.warning(
-                f'Error finding running sandbox for user: {e}', exc_info=True
-            )
-            return None
-
-    async def _select_sandbox_by_strategy(
-        self,
-        running_sandboxes: list[SandboxInfo],
-        sandbox_grouping_strategy: SandboxGroupingStrategy,
-    ) -> SandboxInfo | None:
-        """Select a sandbox from the list based on the configured grouping strategy.
-
-        Args:
-            running_sandboxes: List of running sandboxes for the user
-            sandbox_grouping_strategy: The strategy to use for selection
-
-        Returns:
-            Selected sandbox based on the strategy, or None if no sandbox is available
-            (e.g., all sandboxes have reached max_num_conversations_per_sandbox)
-        """
-        # Get conversation counts for filtering by max_num_conversations_per_sandbox
-        sandbox_conversation_counts = await self._get_conversation_counts_by_sandbox(
-            [s.id for s in running_sandboxes]
-        )
-
-        # Filter out sandboxes that have reached the max number of conversations
-        available_sandboxes = [
-            s
-            for s in running_sandboxes
-            if sandbox_conversation_counts.get(s.id, 0)
-            < self.max_num_conversations_per_sandbox
-        ]
-
-        if not available_sandboxes:
-            # All sandboxes have reached the max - need to create a new one
-            return None
-
-        if sandbox_grouping_strategy == SandboxGroupingStrategy.ADD_TO_ANY:
-            # Return the first available sandbox
-            return available_sandboxes[0]
-
-        elif sandbox_grouping_strategy == SandboxGroupingStrategy.GROUP_BY_NEWEST:
-            # Return the most recently created sandbox
-            return max(available_sandboxes, key=lambda s: s.created_at)
-
-        elif sandbox_grouping_strategy == SandboxGroupingStrategy.LEAST_RECENTLY_USED:
-            # Return the least recently created sandbox (oldest)
-            return min(available_sandboxes, key=lambda s: s.created_at)
-
-        elif sandbox_grouping_strategy == SandboxGroupingStrategy.FEWEST_CONVERSATIONS:
-            # Return the one with fewest conversations
-            return min(
-                available_sandboxes,
-                key=lambda s: sandbox_conversation_counts.get(s.id, 0),
-            )
-
-        else:
-            # Default fallback - return first sandbox
-            return available_sandboxes[0]
-
-    async def _get_conversation_counts_by_sandbox(
-        self, sandbox_ids: list[str]
-    ) -> dict[str, int]:
-        """Get the count of conversations for each sandbox.
-
-        Args:
-            sandbox_ids: List of sandbox IDs to count conversations for
-
-        Returns:
-            Dictionary mapping sandbox_id to conversation count
-        """
-        try:
-            # Query count for each sandbox individually
-            # This is efficient since there are at most ~8 running sandboxes per user
-            counts: dict[str, int] = {}
-            for sandbox_id in sandbox_ids:
-                count = await self.app_conversation_info_service.count_app_conversation_info(
-                    sandbox_id__eq=sandbox_id
-                )
-                counts[sandbox_id] = count
-            return counts
-        except Exception as e:
-            _logger.warning(
-                f'Error counting conversations by sandbox: {e}', exc_info=True
-            )
-            # Return empty counts on error - will default to first sandbox
-            return {}
-
     async def _wait_for_sandbox_start(
         self, task: AppConversationStartTask
     ) -> AsyncGenerator[AppConversationStartTask, None]:
         """Wait for sandbox to start and return info."""
         # Get or create the sandbox
         if not task.request.sandbox_id:
-            # First try to find a running sandbox for the current user
-            sandbox = await self._find_running_sandbox_for_user()
-            if sandbox is None:
-                # No running sandbox found, start a new one
-
-                # Convert conversation_id to hex string if present
-                sandbox_id_str = (
-                    task.request.conversation_id.hex
-                    if task.request.conversation_id is not None
-                    else None
-                )
-
-                sandbox = await self.sandbox_service.start_sandbox(
-                    sandbox_id=sandbox_id_str
-                )
+            # Convert conversation_id to hex string if present
+            sandbox_id_str = (
+                task.request.conversation_id.hex
+                if task.request.conversation_id is not None
+                else None
+            )
+            sandbox = await self.sandbox_service.start_sandbox(
+                sandbox_id=sandbox_id_str
+            )
             task.sandbox_id = sandbox.id
         else:
             sandbox_info = await self.sandbox_service.get_sandbox(
@@ -837,10 +782,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         secrets = await self.user_context.get_secrets()
 
         # Get all provider tokens from user authentication
-        provider_tokens = cast(
-            PROVIDER_TOKEN_TYPE | None,
-            await self.user_context.get_provider_tokens(),
-        )
+        provider_tokens = await self.user_context.get_provider_tokens()
         if not provider_tokens:
             return secrets
 
@@ -898,6 +840,13 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             base_url=base_url,
             api_key=user.llm_api_key,
             usage_id='agent',
+            native_tool_calling=False,
+            reasoning_effort='none',
+            enable_encrypted_reasoning=False,
+            prompt_cache_retention=None,
+            extended_thinking_budget=None,
+            log_completions=os.environ.get("OH_DEBUG_LOG_COMPLETIONS", "0").lower() in ("1", "true", "yes"),
+            log_completions_folder="/workspace/conversations/completions",
         )
 
     async def _get_tavily_api_key(self, user: UserInfo) -> str | None:
@@ -1308,50 +1257,10 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             run=initial_message.run,
         )
 
-    async def _load_hooks_from_workspace(
-        self,
-        remote_workspace: AsyncRemoteWorkspace,
-        project_dir: str,
-    ) -> HookConfig | None:
-        """Load hooks from .openhands/hooks.json in the remote workspace.
-
-        This enables project-level hooks to be automatically loaded when starting
-        a conversation, similar to how OpenHands-CLI loads hooks from the workspace.
-
-        Uses the agent-server's /api/hooks endpoint, consistent with how skills
-        are loaded via /api/skills.
-
-        Args:
-            remote_workspace: AsyncRemoteWorkspace for accessing the agent server
-            project_dir: Project root directory path in the sandbox. This should
-                already be the resolved project directory (e.g.,
-                {working_dir}/{repo_name} when a repo is selected).
-
-        Returns:
-            HookConfig if hooks.json exists and is valid, None otherwise.
-            Returns None in the following cases:
-            - hooks.json file does not exist
-            - hooks.json contains invalid JSON
-            - hooks.json contains an empty hooks configuration
-            - Agent server is unreachable or returns an error
-
-        Note:
-            This method implements graceful degradation - if hooks cannot be loaded
-            for any reason, it returns None rather than raising an exception. This
-            ensures that conversation startup is not blocked by hook loading failures.
-            Errors are logged as warnings for debugging purposes.
-        """
-        return await load_hooks_from_agent_server(
-            agent_server_url=remote_workspace.host,
-            session_api_key=remote_workspace._headers.get('X-Session-API-Key'),
-            project_dir=project_dir,
-            httpx_client=self.httpx_client,
-        )
-
     async def _finalize_conversation_request(
         self,
         agent: Agent,
-        conversation_id: UUID,
+        conversation_id: UUID | None,
         user: UserInfo,
         workspace: LocalWorkspace,
         initial_message: SendMessageRequest | None,
@@ -1387,7 +1296,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         agent = self._update_agent_with_llm_metadata(agent, conversation_id, user.id)
 
         # Load and merge skills if remote workspace is available
-        hook_config: HookConfig | None = None
         if remote_workspace:
             try:
                 agent = await self._load_skills_and_update_agent(
@@ -1397,32 +1305,19 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 _logger.warning(f'Failed to load skills: {e}', exc_info=True)
                 # Continue without skills - don't fail conversation startup
 
-            # Load hooks from workspace (.openhands/hooks.json)
-            # Note: working_dir is already the resolved project_dir
-            # (includes repo name when a repo is selected), so we pass
-            # it directly without appending the repo name again.
-            try:
-                _logger.debug(
-                    f'Attempting to load hooks from workspace: '
-                    f'project_dir={working_dir}'
-                )
-                hook_config = await self._load_hooks_from_workspace(
-                    remote_workspace, working_dir
-                )
-                if hook_config:
-                    _logger.debug(
-                        f'Successfully loaded hooks: {hook_config.model_dump()}'
-                    )
-                else:
-                    _logger.debug('No hooks found in workspace')
-            except Exception as e:
-                _logger.warning(f'Failed to load hooks: {e}', exc_info=True)
-                # Continue without hooks - don't fail conversation startup
-
         # Incorporate plugin parameters into initial message if specified
         final_initial_message = self._construct_initial_message_with_plugin_params(
             initial_message, plugins
         )
+
+        # The current agent-server ignores SendMessageRequest.run during
+        # conversation creation and always calls send_message(..., True) when
+        # initial_message is present. To avoid entering RUNNING before the
+        # first real turn starts, never pass initial_message to
+        # POST /api/conversations. We deliver the initial user message
+        # separately after the conversation is created.
+        if final_initial_message:
+            final_initial_message = None
 
         # Convert PluginSpec list to SDK PluginSource list for agent server
         sdk_plugins: list[PluginSource] | None = None
@@ -1436,30 +1331,37 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 for p in plugins
             ]
 
-        # Create and return the final request
-        return StartConversationRequest(
-            conversation_id=conversation_id,
-            agent=agent,
-            workspace=workspace,
-            confirmation_policy=self._select_confirmation_policy(
+        # Create and return the final request.
+        # Pass max_iterations explicitly when user has set it in settings,
+        # otherwise keep agent-server default.
+        request_kwargs: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "agent": agent,
+            "workspace": workspace,
+            "confirmation_policy": self._select_confirmation_policy(
                 bool(user.confirmation_mode), user.security_analyzer
             ),
-            initial_message=final_initial_message,
-            secrets=secrets,
-            plugins=sdk_plugins,
-            hook_config=hook_config,
-        )
+            "initial_message": final_initial_message,
+            "secrets": secrets,
+            "plugins": sdk_plugins,
+            # Avoid noisy auto-title call before first user message is persisted.
+            "autotitle": False,
+        }
+        if user.max_iterations is not None:
+            request_kwargs["max_iterations"] = int(user.max_iterations)
+
+        return StartConversationRequest(**request_kwargs)
 
     async def _build_start_conversation_request_for_user(
         self,
         sandbox: SandboxInfo,
-        conversation_id: UUID,
         initial_message: SendMessageRequest | None,
         system_message_suffix: str | None,
         git_provider: ProviderType | None,
         working_dir: str,
         agent_type: AgentType = AgentType.DEFAULT,
         llm_model: str | None = None,
+        conversation_id: UUID | None = None,
         remote_workspace: AsyncRemoteWorkspace | None = None,
         selected_repository: str | None = None,
         plugins: list[PluginSpec] | None = None,
@@ -1474,12 +1376,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         5. Passing plugins to the agent server for remote plugin loading
         """
         user = await self.user_context.get_user_info()
-
-        # Compute the project root — this is the repo directory when a repo is
-        # selected, or the sandbox working_dir otherwise.  All tools, hooks,
-        # setup scripts, and plan paths must use this consistently.
-        project_dir = get_project_dir(working_dir, selected_repository)
-        workspace = LocalWorkspace(working_dir=project_dir)
+        workspace = LocalWorkspace(working_dir=working_dir)
 
         # Set up secrets for all git providers
         secrets = await self._setup_secrets_for_git_providers(user)
@@ -1496,7 +1393,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             user.condenser_max_size,
             secrets=secrets,
             git_provider=git_provider,
-            working_dir=project_dir,
+            working_dir=working_dir,
         )
 
         # Finalize and return the conversation request
@@ -1510,91 +1407,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             sandbox,
             remote_workspace,
             selected_repository,
-            project_dir,
+            working_dir,
             plugins=plugins,
-        )
-
-    async def _process_pending_messages(
-        self,
-        task_id: UUID,
-        conversation_id: UUID,
-        agent_server_url: str,
-        session_api_key: str,
-    ) -> None:
-        """Process pending messages queued before conversation was ready.
-
-        Messages are delivered concurrently to the agent server. After processing,
-        all messages are deleted from the database regardless of success or failure.
-
-        Args:
-            task_id: The start task ID (may have been used as conversation_id initially)
-            conversation_id: The real conversation ID
-            agent_server_url: URL of the agent server
-            session_api_key: API key for authenticating with agent server
-        """
-        # Convert UUIDs to strings for the pending message service
-        # The frontend uses task-{uuid.hex} format (no hyphens), matching OpenHandsUUID serialization
-        task_id_str = f'task-{task_id.hex}'
-        # conversation_id uses standard format (with hyphens) for agent server API compatibility
-        conversation_id_str = str(conversation_id)
-
-        _logger.info(f'task_id={task_id_str} conversation_id={conversation_id_str}')
-
-        # First, update any messages that were queued with the task_id
-        updated_count = await self.pending_message_service.update_conversation_id(
-            old_conversation_id=task_id_str,
-            new_conversation_id=conversation_id_str,
-        )
-        _logger.info(f'updated_count={updated_count} ')
-        if updated_count > 0:
-            _logger.info(
-                f'Updated {updated_count} pending messages from task_id={task_id_str} '
-                f'to conversation_id={conversation_id_str}'
-            )
-
-        # Get all pending messages for this conversation
-        pending_messages = await self.pending_message_service.get_pending_messages(
-            conversation_id_str
-        )
-
-        if not pending_messages:
-            return
-
-        _logger.info(
-            f'Processing {len(pending_messages)} pending messages for '
-            f'conversation {conversation_id_str}'
-        )
-
-        # Process messages sequentially to preserve order
-        for msg in pending_messages:
-            try:
-                # Serialize content objects to JSON-compatible dicts
-                content_json = [item.model_dump() for item in msg.content]
-                # Use the events endpoint which handles message sending
-                response = await self.httpx_client.post(
-                    f'{agent_server_url}/api/conversations/{conversation_id_str}/events',
-                    json={
-                        'role': msg.role,
-                        'content': content_json,
-                        'run': True,
-                    },
-                    headers={'X-Session-API-Key': session_api_key},
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-                _logger.debug(f'Delivered pending message {msg.id}')
-            except Exception as e:
-                _logger.warning(f'Failed to deliver pending message {msg.id}: {e}')
-
-        # Delete all pending messages after processing (regardless of success/failure)
-        deleted_count = (
-            await self.pending_message_service.delete_messages_for_conversation(
-                conversation_id_str
-            )
-        )
-        _logger.info(
-            f'Finished processing pending messages for conversation {conversation_id_str}. '
-            f'Deleted {deleted_count} messages.'
         )
 
     async def update_agent_server_conversation_title(
@@ -1740,19 +1554,13 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         conversations = await self._build_app_conversations([info])
         return conversations[0]
 
-    async def delete_app_conversation(
-        self, conversation_id: UUID, skip_agent_server_delete: bool = False
-    ) -> bool:
+    async def delete_app_conversation(self, conversation_id: UUID) -> bool:
         """Delete a V1 conversation and all its associated data.
 
         This method will also cascade delete all sub-conversations of the parent.
 
         Args:
             conversation_id: The UUID of the conversation to delete.
-            skip_agent_server_delete: If True, skip the agent server DELETE call.
-                This should be set when the sandbox is shared with other
-                conversations (e.g. created via /new) to avoid destabilizing
-                the shared runtime.
         """
         # Check if we have the required SQL implementation for transactional deletion
         if not isinstance(
@@ -1778,9 +1586,8 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             await self._delete_sub_conversations(conversation_id)
 
             # Now delete the parent conversation
-            # Delete from agent server if sandbox is running (skip if sandbox is shared)
-            if not skip_agent_server_delete:
-                await self._delete_from_agent_server(app_conversation)
+            # Delete from agent server if sandbox is running
+            await self._delete_from_agent_server(app_conversation)
 
             # Delete from database using the conversation info from app_conversation
             # AppConversation extends AppConversationInfo, so we can use it directly
@@ -1946,10 +1753,6 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
     sandbox_startup_poll_frequency: int = Field(
         default=2, description='The frequency to poll for sandbox readiness'
     )
-    max_num_conversations_per_sandbox: int = Field(
-        default=20,
-        description='The maximum number of conversations allowed per sandbox',
-    )
     init_git_in_empty_workspace: bool = Field(
         default=True,
         description='Whether to initialize a git repo when the workspace is empty',
@@ -1976,7 +1779,6 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
             get_global_config,
             get_httpx_client,
             get_jwt_service,
-            get_pending_message_service,
             get_sandbox_service,
             get_sandbox_spec_service,
             get_user_context,
@@ -1996,7 +1798,6 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
             get_event_service(state, request) as event_service,
             get_jwt_service(state, request) as jwt_service,
             get_httpx_client(state, request) as httpx_client,
-            get_pending_message_service(state, request) as pending_message_service,
         ):
             access_token_hard_timeout = None
             if self.access_token_hard_timeout:
@@ -2041,10 +1842,8 @@ class LiveStatusAppConversationServiceInjector(AppConversationServiceInjector):
                 event_callback_service=event_callback_service,
                 event_service=event_service,
                 jwt_service=jwt_service,
-                pending_message_service=pending_message_service,
                 sandbox_startup_timeout=self.sandbox_startup_timeout,
                 sandbox_startup_poll_frequency=self.sandbox_startup_poll_frequency,
-                max_num_conversations_per_sandbox=self.max_num_conversations_per_sandbox,
                 httpx_client=httpx_client,
                 web_url=web_url,
                 openhands_provider_base_url=config.openhands_provider_base_url,
