@@ -106,6 +106,62 @@ def get_provider_api_base(model: str) -> str | None:
     return None
 
 
+def _normalize_openai_compatible_base_urls(base_url: str) -> list[str]:
+    """Generate candidate OpenAI-compatible base URLs.
+
+    LiteLLM/OpenAI-compatible gateways may expose models on either:
+    - <base_url>/models
+    - <base_url>/v1/models
+    """
+    stripped = base_url.strip().rstrip('/')
+    if not stripped:
+        return []
+    if stripped.endswith('/v1'):
+        return [stripped]
+    return [f'{stripped}/v1', stripped]
+
+
+def get_openai_compatible_models(
+    base_url: str | None,
+    api_key: str | None,
+    timeout_seconds: float = 3.0,
+) -> list[str]:
+    """Fetch model IDs from an OpenAI-compatible `/models` endpoint.
+
+    Returns an empty list on any network/auth/format issue to keep the UI resilient.
+    """
+    if not base_url:
+        return []
+
+    headers: dict[str, str] = {}
+    if api_key and api_key.strip():
+        headers['Authorization'] = f'Bearer {api_key.strip()}'
+
+    for candidate in _normalize_openai_compatible_base_urls(base_url):
+        endpoint = f'{candidate}/models'
+        try:
+            response = httpx.get(endpoint, headers=headers, timeout=timeout_seconds)  # noqa: ASYNC100
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get('data') if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                continue
+
+            models = sorted(
+                {
+                    item.get('id')
+                    for item in data
+                    if isinstance(item, dict) and isinstance(item.get('id'), str)
+                }
+            )
+            if models:
+                return models
+        except Exception as e:
+            logger.debug(f'Failed to fetch models from {endpoint}: {e}')
+
+    return []
+
+
 def get_supported_llm_models(
     config: OpenHandsConfig,
     verified_models: list[str] | None = None,

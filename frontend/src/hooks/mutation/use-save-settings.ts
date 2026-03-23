@@ -61,6 +61,9 @@ export const useSaveSettings = () => {
       await queryClient.invalidateQueries({
         queryKey: ["settings", organizationId],
       });
+      await queryClient.invalidateQueries({
+        queryKey: ["ai-config-options"],
+      });
     },
     meta: {
       disableToast: true,

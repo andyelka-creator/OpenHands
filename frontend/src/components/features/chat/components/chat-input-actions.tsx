@@ -9,6 +9,7 @@ import { AgentState } from "#/types/agent-state";
 import { useV1PauseConversation } from "#/hooks/mutation/use-v1-pause-conversation";
 import { useV1ResumeConversation } from "#/hooks/mutation/use-v1-resume-conversation";
 import { ChangeAgentButton } from "../change-agent-button";
+import { QuickModelSwitcher } from "../quick-model-switcher";
 
 interface ChatInputActionsProps {
   disabled: boolean;
@@ -60,6 +61,7 @@ export function ChatInputActions({
         <div className="flex items-center gap-4">
           <Tools />
           <ChangeAgentButton />
+          <QuickModelSwitcher />
         </div>
       </div>
       <AgentStatus

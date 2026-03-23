@@ -15,19 +15,46 @@ from openhands.controller.agent import Agent
 from openhands.security.options import SecurityAnalyzers
 from openhands.server.dependencies import get_dependencies
 from openhands.server.shared import config, server_config
-from openhands.utils.llm import get_supported_llm_models
+from openhands.server.user_auth import get_user_settings
+from openhands.storage.data_models.settings import Settings
+from openhands.utils.llm import (
+    get_openai_compatible_models,
+    get_supported_llm_models,
+)
 
 app = APIRouter(prefix='/api/options', dependencies=get_dependencies())
+LITELLM_PROXY_PROVIDER = 'litellm_proxy'
 
 
-async def get_llm_models_dependency(request: Request) -> list[str]:
+async def get_llm_models_dependency(
+    _request: Request,
+    settings: Settings | None = Depends(get_user_settings),
+) -> list[str]:
     """Returns a callable that provides the LLM models implementation.
 
     Returns a factory that produces the actual implementation function.
     Override this in enterprise/saas mode via app.dependency_overrides.
     """
 
-    return get_supported_llm_models(config, [])
+    models = get_supported_llm_models(config, [])
+
+    # If user configured an OpenAI-compatible gateway (e.g. LiteLLM),
+    # keep those models under a dedicated provider block in the selector.
+    if settings and settings.llm_base_url:
+        api_key = (
+            settings.llm_api_key.get_secret_value() if settings.llm_api_key else None
+        )
+        dynamic_models = get_openai_compatible_models(
+            settings.llm_base_url,
+            api_key,
+        )
+        if dynamic_models:
+            dynamic_litellm_models = [
+                f'{LITELLM_PROXY_PROVIDER}/{model_id}' for model_id in dynamic_models
+            ]
+            models = sorted(set(models + dynamic_litellm_models))
+
+    return models
 
 
 @app.get('/models')
