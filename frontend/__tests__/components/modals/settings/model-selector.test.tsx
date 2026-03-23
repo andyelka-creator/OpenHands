@@ -36,6 +36,10 @@ describe("ModelSelector", () => {
       separator: ".",
       models: ["command-r-v1:0"],
     },
+    litellm_proxy: {
+      separator: "/",
+      models: ["3090ti-qwen3-coder-30b", "mac-omlx-qwen35-27b-claude46-4bit"],
+    },
   };
 
   it("should display the provider selector", async () => {
@@ -50,7 +54,25 @@ describe("ModelSelector", () => {
     expect(screen.getByText("OpenAI")).toBeInTheDocument();
     expect(screen.getByText("Azure")).toBeInTheDocument();
     expect(screen.getByText("VertexAI")).toBeInTheDocument();
+    expect(screen.getByTestId("provider-item-litellm_proxy")).toBeInTheDocument();
     expect(screen.getByText("cohere")).toBeInTheDocument();
+  });
+
+  it("should show LiteLLM models in dedicated section", async () => {
+    const user = userEvent.setup();
+    render(<ModelSelector models={models} />);
+
+    const providerSelector = screen.getByLabelText("LLM Provider");
+    await user.click(providerSelector);
+    await user.click(screen.getByTestId("provider-item-litellm_proxy"));
+
+    const modelSelector = screen.getByLabelText("LLM Model");
+    await user.click(modelSelector);
+
+    expect(screen.getByText("3090ti-qwen3-coder-30b")).toBeInTheDocument();
+    expect(
+      screen.getByText("mac-omlx-qwen35-27b-claude46-4bit"),
+    ).toBeInTheDocument();
   });
 
   it("should disable the model selector if the provider is not selected", async () => {

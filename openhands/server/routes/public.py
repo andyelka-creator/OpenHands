@@ -23,6 +23,7 @@ from openhands.utils.llm import (
 )
 
 app = APIRouter(prefix='/api/options', dependencies=get_dependencies())
+LITELLM_PROXY_PROVIDER = 'litellm_proxy'
 
 
 async def get_llm_models_dependency(
@@ -38,7 +39,7 @@ async def get_llm_models_dependency(
     models = get_supported_llm_models(config, [])
 
     # If user configured an OpenAI-compatible gateway (e.g. LiteLLM),
-    # merge models advertised by that gateway into the selector list.
+    # keep those models under a dedicated provider block in the selector.
     if settings and settings.llm_base_url:
         api_key = (
             settings.llm_api_key.get_secret_value() if settings.llm_api_key else None
@@ -48,7 +49,10 @@ async def get_llm_models_dependency(
             api_key,
         )
         if dynamic_models:
-            models = sorted(set(models + dynamic_models))
+            dynamic_litellm_models = [
+                f'{LITELLM_PROXY_PROVIDER}/{model_id}' for model_id in dynamic_models
+            ]
+            models = sorted(set(models + dynamic_litellm_models))
 
     return models
 

@@ -17,6 +17,8 @@ import { cn } from "#/utils/utils";
 import { HelpLink } from "#/ui/help-link";
 import { PRODUCT_URL } from "#/utils/constants";
 
+const LITELLM_PROVIDER_ID = "litellm_proxy";
+
 interface ModelSelectorProps {
   isDisabled?: boolean;
   models: Record<string, { separator: string; models: string[] }>;
@@ -92,6 +94,23 @@ export function ModelSelector({
   };
 
   const { t } = useTranslation();
+  const providers = Object.keys(models);
+  const hasLiteLLMProvider = providers.includes(LITELLM_PROVIDER_ID);
+  const verifiedProviders = VERIFIED_PROVIDERS.filter(
+    (provider) => models[provider],
+  );
+  const otherProviders = providers.filter(
+    (provider) =>
+      !VERIFIED_PROVIDERS.includes(provider) &&
+      provider !== LITELLM_PROVIDER_ID,
+  );
+  const selectedProviderModels = models[selectedProvider || ""]?.models ?? [];
+  const verifiedModels = getVerifiedModels().filter((model) =>
+    selectedProviderModels.includes(model),
+  );
+  const otherModels = selectedProviderModels.filter(
+    (model) => !getVerifiedModels().includes(model),
+  );
 
   return (
     <div
@@ -130,28 +149,32 @@ export function ModelSelector({
           }}
         >
           <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$VERIFIED)}>
-            {VERIFIED_PROVIDERS.filter((provider) => models[provider]).map(
-              (provider) => (
-                <AutocompleteItem
-                  data-testid={`provider-item-${provider}`}
-                  key={provider}
-                >
+            {verifiedProviders.map((provider) => (
+              <AutocompleteItem
+                data-testid={`provider-item-${provider}`}
+                key={provider}
+              >
+                {mapProvider(provider)}
+              </AutocompleteItem>
+            ))}
+          </AutocompleteSection>
+          {hasLiteLLMProvider ? (
+            <AutocompleteSection title="LiteLLM">
+              <AutocompleteItem
+                data-testid={`provider-item-${LITELLM_PROVIDER_ID}`}
+                key={LITELLM_PROVIDER_ID}
+              >
+                {mapProvider(LITELLM_PROVIDER_ID)}
+              </AutocompleteItem>
+            </AutocompleteSection>
+          ) : null}
+          {otherProviders.length ? (
+            <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$OTHERS)}>
+              {otherProviders.map((provider) => (
+                <AutocompleteItem key={provider}>
                   {mapProvider(provider)}
                 </AutocompleteItem>
-              ),
-            )}
-          </AutocompleteSection>
-          {Object.keys(models).some(
-            (provider) => !VERIFIED_PROVIDERS.includes(provider),
-          ) ? (
-            <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$OTHERS)}>
-              {Object.keys(models)
-                .filter((provider) => !VERIFIED_PROVIDERS.includes(provider))
-                .map((provider) => (
-                  <AutocompleteItem key={provider}>
-                    {mapProvider(provider)}
-                  </AutocompleteItem>
-                ))}
+              ))}
             </AutocompleteSection>
           ) : null}
         </Autocomplete>
@@ -196,29 +219,34 @@ export function ModelSelector({
             },
           }}
         >
-          <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$VERIFIED)}>
-            {getVerifiedModels()
-              .filter((model) =>
-                models[selectedProvider || ""]?.models?.includes(model),
-              )
-              .map((model) => (
+          {selectedProvider === LITELLM_PROVIDER_ID ? (
+            <AutocompleteSection title="LiteLLM">
+              {selectedProviderModels.map((model) => (
+                <AutocompleteItem
+                  data-testid={`model-item-${model}`}
+                  key={model}
+                >
+                  {model}
+                </AutocompleteItem>
+              ))}
+            </AutocompleteSection>
+          ) : (
+            <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$VERIFIED)}>
+              {verifiedModels.map((model) => (
                 <AutocompleteItem key={model}>{model}</AutocompleteItem>
               ))}
-          </AutocompleteSection>
-          {models[selectedProvider || ""]?.models?.some(
-            (model) => !getVerifiedModels().includes(model),
-          ) ? (
+            </AutocompleteSection>
+          )}
+          {selectedProvider !== LITELLM_PROVIDER_ID && otherModels.length ? (
             <AutocompleteSection title={t(I18nKey.MODEL_SELECTOR$OTHERS)}>
-              {models[selectedProvider || ""]?.models
-                .filter((model) => !getVerifiedModels().includes(model))
-                .map((model) => (
-                  <AutocompleteItem
-                    data-testid={`model-item-${model}`}
-                    key={model}
-                  >
-                    {model}
-                  </AutocompleteItem>
-                ))}
+              {otherModels.map((model) => (
+                <AutocompleteItem
+                  data-testid={`model-item-${model}`}
+                  key={model}
+                >
+                  {model}
+                </AutocompleteItem>
+              ))}
             </AutocompleteSection>
           ) : null}
         </Autocomplete>
