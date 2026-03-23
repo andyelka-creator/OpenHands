@@ -61,6 +61,11 @@ interface SendMessageResult {
   queued: boolean; // true if message was queued for later delivery, false if sent immediately
 }
 
+interface LocalPendingMessage {
+  mode: "code" | "plan";
+  message: V1SendMessageRequest;
+}
+
 interface ConversationWebSocketContextType {
   connectionState: V1_WebSocketConnectionState;
   sendMessage: (message: V1SendMessageRequest) => Promise<SendMessageResult>;
@@ -125,6 +130,8 @@ export function ConversationWebSocketProvider({
   // Separate received event count tracking per connection
   const receivedEventCountRefMain = useRef(0);
   const receivedEventCountRefPlanning = useRef(0);
+  const localPendingMessagesRef = useRef<LocalPendingMessage[]>([]);
+  const pendingMessageApiUnsupportedRef = useRef(false);
 
   // Track the latest PlanningFileEditorObservation for Plan.md during history replay
   const latestPlanningFileEventRef = useRef<{
@@ -818,6 +825,34 @@ export function ConversationWebSocketProvider({
     planningWebsocketOptions,
   );
 
+  const flushLocalPendingMessages = useCallback(() => {
+    if (localPendingMessagesRef.current.length === 0) {
+      return;
+    }
+
+    const remainingMessages: LocalPendingMessage[] = [];
+    for (const pending of localPendingMessagesRef.current) {
+      const targetSocket =
+        pending.mode === "plan" ? planningAgentSocket : mainSocket;
+
+      if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
+        remainingMessages.push(pending);
+      } else {
+        try {
+          targetSocket.send(JSON.stringify(pending.message));
+        } catch {
+          remainingMessages.push(pending);
+        }
+      }
+    }
+
+    localPendingMessagesRef.current = remainingMessages;
+  }, [mainSocket, planningAgentSocket]);
+
+  useEffect(() => {
+    flushLocalPendingMessages();
+  }, [flushLocalPendingMessages]);
+
   // V1 send message function via WebSocket
   // Falls back to REST API queue when WebSocket is not connected
   const sendMessage = useCallback(
@@ -835,6 +870,14 @@ export function ConversationWebSocketProvider({
           throw error;
         }
 
+        if (pendingMessageApiUnsupportedRef.current) {
+          localPendingMessagesRef.current.push({
+            mode: currentMode,
+            message,
+          });
+          return { queued: true };
+        }
+
         try {
           await PendingMessageService.queueMessage(conversationId, {
             role: "user",
@@ -844,6 +887,28 @@ export function ConversationWebSocketProvider({
           // Return queued: true so caller knows not to show optimistic UI
           return { queued: true };
         } catch (error) {
+          const statusCode =
+            typeof error === "object" &&
+            error !== null &&
+            "response" in error &&
+            typeof error.response === "object" &&
+            error.response !== null &&
+            "status" in error.response &&
+            typeof error.response.status === "number"
+              ? error.response.status
+              : null;
+
+          // Backward compatibility for older OpenHands app-server builds
+          // that don't expose /api/v1/conversations/{id}/pending-messages.
+          if (statusCode === 404 || statusCode === 405) {
+            pendingMessageApiUnsupportedRef.current = true;
+            localPendingMessagesRef.current.push({
+              mode: currentMode,
+              message,
+            });
+            return { queued: true };
+          }
+
           const errorMessage =
             error instanceof Error
               ? error.message
@@ -864,7 +929,13 @@ export function ConversationWebSocketProvider({
         throw error;
       }
     },
-    [mainSocket, planningAgentSocket, setErrorMessage, conversationId],
+    [
+      mainSocket,
+      planningAgentSocket,
+      setErrorMessage,
+      conversationId,
+      flushLocalPendingMessages,
+    ],
   );
 
   // Track main socket state changes
