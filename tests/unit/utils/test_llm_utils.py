@@ -1,6 +1,9 @@
 """Tests for openhands.utils.llm module."""
 
+import httpx
+
 from openhands.utils.llm import get_provider_api_base, is_openhands_model
+from openhands.utils.llm import get_openai_compatible_models
 
 
 class TestIsOpenhandsModel:
@@ -72,3 +75,92 @@ class TestGetProviderApiBase:
         # May return None or an API base depending on litellm behavior
         # The function should not raise an exception
         assert result is None or isinstance(result, str)
+
+
+class TestGetOpenAICompatibleModels:
+    """Tests for OpenAI-compatible dynamic model discovery."""
+
+    def test_fetches_models_from_v1_endpoint_first(self, monkeypatch):
+        called_urls: list[str] = []
+
+        class MockResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    'data': [
+                        {'id': 'qwen3-coder-next'},
+                        {'id': 'premium-openai'},
+                        {'id': 'qwen3-coder-next'},
+                    ]
+                }
+
+        def mock_get(url, headers=None, timeout=None):
+            called_urls.append(url)
+            return MockResponse()
+
+        monkeypatch.setattr('openhands.utils.llm.httpx.get', mock_get)
+
+        models = get_openai_compatible_models(
+            base_url='http://127.0.0.1:4000',
+            api_key='test-key',
+        )
+
+        assert called_urls == ['http://127.0.0.1:4000/v1/models']
+        assert models == ['premium-openai', 'qwen3-coder-next']
+
+    def test_falls_back_to_non_v1_endpoint(self, monkeypatch):
+        called_urls: list[str] = []
+
+        class MockResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'id': 'model-a'}]}
+
+        def mock_get(url, headers=None, timeout=None):
+            called_urls.append(url)
+            if url.endswith('/v1/models'):
+                raise httpx.ConnectError('connection failed')
+            return MockResponse()
+
+        monkeypatch.setattr('openhands.utils.llm.httpx.get', mock_get)
+
+        models = get_openai_compatible_models(
+            base_url='http://127.0.0.1:4000',
+            api_key=None,
+        )
+
+        assert called_urls == [
+            'http://127.0.0.1:4000/v1/models',
+            'http://127.0.0.1:4000/models',
+        ]
+        assert models == ['model-a']
+
+    def test_returns_empty_list_for_invalid_payload(self, monkeypatch):
+        class MockResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'unexpected': 'shape'}
+
+        monkeypatch.setattr(
+            'openhands.utils.llm.httpx.get',
+            lambda *args, **kwargs: MockResponse(),
+        )
+
+        models = get_openai_compatible_models(
+            base_url='http://127.0.0.1:4000',
+            api_key=None,
+        )
+
+        assert models == []
